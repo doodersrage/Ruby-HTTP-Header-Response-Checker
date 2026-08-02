@@ -1,78 +1,95 @@
-# default constants
-# set results file
-SAVEFILE = "results.tsv"
-# set page list file name
-FILENAME = "pages.csv"
-# set domain string for replacement
-REPLACE = "http://studiocenter.com/"
-# set new domain string
-NEWURL = "http://studiocenter.com/"
+# frozen_string_literal: true
 
-#link check class
+require 'net/http'
+require 'openssl'
+require 'uri'
+
+# Checks HTTP response codes and follows redirects.
 class LinkCheck
-    # accessors
-    attr_reader :redirects
-    attr_reader :responses
+  DEFAULT_TIMEOUT = 15
+  DEFAULT_REDIRECT_LIMIT = 10
 
-    # init counters
-    def initialize
-        @@redcnt = 0
-        @@ntfcnt = 0
-        @@okcnt = 0
+  attr_reader :redirects, :responses, :redirect_count, :success_count, :error_count
 
-        # store redirects
-        @redirects = Array.new
-        @responses = Array.new
+  def initialize(timeout: DEFAULT_TIMEOUT, redirect_limit: DEFAULT_REDIRECT_LIMIT, verify_ssl: true)
+    @timeout = timeout
+    @redirect_limit = redirect_limit
+    @verify_ssl = verify_ssl
+    reset
+  end
+
+  def reset
+    @redirects = []
+    @responses = []
+    @redirect_count = 0
+    @success_count = 0
+    @error_count = 0
+  end
+
+  def fetch(url, limit = @redirect_limit, start_time = nil)
+    start_time ||= Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    uri = URI(url)
+
+    response = http_get(uri)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+
+    case response
+    when Net::HTTPSuccess
+      @success_count += 1
+      { res: response.code, res_time: elapsed }
+    when Net::HTTPRedirection
+      @redirect_count += 1
+      location = response['location']
+      unless location
+        @error_count += 1
+        return { res: response.code, res_time: elapsed, error: 'redirect missing Location header' }
+      end
+
+      next_uri = URI.join(uri, location).to_s
+      warn "#{uri} redirected to #{next_uri}" if $VERBOSE
+
+      @redirects << next_uri
+      @responses << response.code
+
+      if limit <= 1
+        @error_count += 1
+        return { res: response.code, res_time: elapsed, error: 'redirect limit exceeded' }
+      end
+
+      fetch(next_uri, limit - 1, start_time)
+    else
+      @error_count += 1
+      { res: response.code, res_time: elapsed }
     end
+  rescue URI::InvalidURIError => e
+    @error_count += 1
+    { res: 'ERR', res_time: 0, error: "invalid URI: #{e.message}" }
+  rescue Net::OpenTimeout, Net::ReadTimeout, Timeout::Error
+    @error_count += 1
+    { res: '408', res_time: 0, error: 'request timed out' }
+  rescue SocketError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
+    @error_count += 1
+    { res: '408', res_time: 0, error: e.message }
+  rescue StandardError => e
+    @error_count += 1
+    warn "Error fetching #{url}: #{e.class}: #{e.message}" if $VERBOSE
+    { res: 'ERR', res_time: 0, error: e.message }
+  end
 
-    def reset
-        # store redirects
-        @redirects = Array.new
-        @responses = Array.new
+  private
+
+  def http_get(uri)
+    Net::HTTP.start(
+      uri.host,
+      uri.port,
+      use_ssl: uri.scheme == 'https',
+      open_timeout: @timeout,
+      read_timeout: @timeout,
+      verify_mode: @verify_ssl ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
+    ) do |http|
+      request = Net::HTTP::Get.new(uri)
+      request['User-Agent'] = 'Ruby-HTTP-Header-Response-Checker/2.0'
+      http.request(request)
     end
-
-    # set class variable accessors
-    def redcnt
-        @@redcnt
-    end
-
-    def ntfcnt
-        @@ntfcnt
-    end
-
-    def okcnt
-        @@okcnt
-    end
-
-    # check link for results
-    def fetch(uri, limit = 10)
-
-        begin
-          uri = URI(uri)
-
-          t1 = Time.now
-          response = Net::HTTP.get_response(uri)
-          t2 = Time.now
-          delta = t2 - t1
-
-          case response
-          when Net::HTTPSuccess then
-              @@okcnt += 1
-              {res: response.code, resTime: delta}
-          when Net::HTTPRedirection then
-              @@redcnt += 1
-              location = response['location']
-              warn "#{uri} redirected to #{location}"
-              @redirects << location
-              @responses << response.code
-              fetch(location, limit - 1)
-          else
-              @@ntfcnt += 1
-              {res: response.code, resTime: delta}
-          end
-        rescue
-          {res: 408, resTime: 0}
-        end
-
-    end
+  end
 end
